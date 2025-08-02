@@ -8,6 +8,7 @@ interface PlayerData {
     y: number;
     character: string;
     username: string;
+    score: number;
 }
 
 interface Session {
@@ -52,17 +53,15 @@ io.on('connection', (socket) => {
                 players: {},
             };
             activeSessions[quizId] = session;
-            console.log(`[Sesi] Sesi baru dibuat untuk Kuis ID ${quizId} dengan kode ${session.roomCode}`);
         }
 
         if (session.cleanupTimeout) {
             clearTimeout(session.cleanupTimeout);
             delete session.cleanupTimeout;
-            console.log(`[Sesi] Sesi untuk Kuis ID ${quizId} diaktifkan kembali.`);
         }
 
         socket.join(session.roomCode);
-        session.players[socket.id] = playerInfo;
+        session.players[socket.id] = { ...playerInfo, score: 0 };
 
         socket.emit('session_ready', {
             quizId,
@@ -75,6 +74,8 @@ io.on('connection', (socket) => {
             playerId: socket.id,
             playerInfo: session.players[socket.id]
         });
+        
+        io.to(session.roomCode).emit('leaderboard_update', Object.values(session.players));
     });
 
     socket.on('player_movement', ({ roomCode, x, y }) => {
@@ -83,6 +84,14 @@ io.on('connection', (socket) => {
             session.players[socket.id].x = x;
             session.players[socket.id].y = y;
             socket.to(roomCode).emit('player_moved', { playerId: socket.id, x, y });
+        }
+    });
+
+    socket.on('update_score', ({ roomCode, score }) => {
+        const session = Object.values(activeSessions).find(s => s.roomCode === roomCode);
+        if (session?.players[socket.id]) {
+            session.players[socket.id].score = score;
+            io.to(roomCode).emit('leaderboard_update', Object.values(session.players));
         }
     });
 
@@ -95,10 +104,12 @@ io.on('connection', (socket) => {
             if (session.players[socket.id]) {
                 roomCodeToNotify = session.roomCode;
                 delete session.players[socket.id];
-                socket.to(roomCodeToNotify).emit('player_disconnected', socket.id);
+                io.to(roomCodeToNotify).emit('player_disconnected', socket.id);
                 
                 if (Object.keys(session.players).length === 0) {
                     quizIdToClean = quizId;
+                } else {
+                    io.to(roomCodeToNotify).emit('leaderboard_update', Object.values(session.players));
                 }
                 break;
             }
@@ -106,10 +117,8 @@ io.on('connection', (socket) => {
 
         if (quizIdToClean) {
             const session = activeSessions[quizIdToClean];
-            console.log(`[Sesi] Sesi untuk Kuis ID ${quizIdToClean} kosong. Memulai timer pembersihan...`);
             session.cleanupTimeout = setTimeout(() => {
                 delete activeSessions[quizIdToClean!];
-                console.log(`[Sesi] Sesi untuk Kuis ID ${quizIdToClean} telah dihapus.`);
             }, 60000);
         }
     });
