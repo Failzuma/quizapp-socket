@@ -22,10 +22,10 @@ interface Session {
 const activeSessionsByQuizId: { [quizId: string]: Session } = {};
 const activeSessionsByRoomCode: { [roomCode: string]: Session } = {};
 
-// === Rotating log system ===
+
 function getLogFilePath() {
     const today = new Date();
-    const dateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD
+    const dateStr = today.toISOString().split('T')[0]; 
     return path.join(__dirname, `logs/server-${dateStr}.log`);
 }
 
@@ -33,7 +33,7 @@ function log(message: string) {
     const now = new Date();
     const offsetMs = 7 * 60 * 60 * 1000; // UTC+7
     const localTime = new Date(now.getTime() + offsetMs);
-    const timestamp = localTime.toISOString().replace('T', ' ').replace('Z', ''); // Format: YYYY-MM-DD HH:mm:ss
+    const timestamp = localTime.toISOString().replace('T', ' ').replace('Z', '');
     const logLine = `[${timestamp}] ${message}`;
     console.log(logLine);
 
@@ -41,7 +41,6 @@ function log(message: string) {
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
     fs.appendFileSync(logPath, logLine + '\n');
 }
-
 
 // === Room code generator ===
 function generateRoomCode(): string {
@@ -83,11 +82,7 @@ io.on('connection', (socket) => {
             log(`[=] Reusing existing session: quiz=${quizId}, room=${session.roomCode}`);
         }
 
-        if (session.cleanupTimeout) {
-            clearTimeout(session.cleanupTimeout);
-            delete session.cleanupTimeout;
-            log(`[~] Cancelled cleanup timeout for room ${session.roomCode}`);
-        }
+        // ❌ Do not cancel timeout here anymore
 
         socket.emit('session_created', { roomCode: session.roomCode });
     });
@@ -98,6 +93,13 @@ io.on('connection', (socket) => {
             log(`[!] Failed join: Room ${roomCode} not found`);
             socket.emit('error', { message: 'Room not found' });
             return;
+        }
+
+
+        if (session.cleanupTimeout) {
+            clearTimeout(session.cleanupTimeout);
+            delete session.cleanupTimeout;
+            log(`[~] Cancelled cleanup timeout for room ${roomCode} due to player rejoin`);
         }
 
         socket.join(roomCode);
@@ -144,6 +146,7 @@ io.on('connection', (socket) => {
 
                 if (Object.keys(session.players).length === 0) {
                     session.cleanupTimeout = setTimeout(() => {
+                        log(`[!] Cleaning up session now: room=${session.roomCode}, quiz=${session.quizId}`);
                         delete activeSessionsByQuizId[session.quizId];
                         delete activeSessionsByRoomCode[session.roomCode];
                         log(`[x] Session cleaned up: room ${roomCode}, quiz ${session.quizId}`);
