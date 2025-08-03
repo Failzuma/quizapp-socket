@@ -8,7 +8,6 @@ interface PlayerData {
     y: number;
     character: string;
     username: string;
-    score: number;
 }
 
 interface Session {
@@ -16,10 +15,12 @@ interface Session {
     players: {
         [playerId: string]: PlayerData;
     };
+    quizId: string;
     cleanupTimeout?: NodeJS.Timeout;
 }
 
-const activeSessions: Record<string, Session> = {};
+const activeSessionsByQuizId: { [quizId: string]: Session } = {};
+const activeSessionsByRoomCode: { [roomCode: string]: Session } = {};
 
 const generateRoomCode = (): string => {
     let code = '';
@@ -27,32 +28,31 @@ const generateRoomCode = (): string => {
     for (let i = 0; i < 6; i++) {
         code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    const isCodeInUse = Object.values(activeSessions).some(session => session.roomCode === code);
-    if (isCodeInUse) {
-        return generateRoomCode();
-    }
-    return code;
+    return activeSessionsByRoomCode[code] ? generateRoomCode() : code;
 };
 
 const httpServer = createServer();
 
 const io = new Server(httpServer, {
     cors: {
-        origin: "*", 
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
 
 io.on('connection', (socket) => {
-    socket.on('request_session', ({ quizId, playerInfo }) => {
-        let session = activeSessions[quizId];
+    socket.on('request_session', (quizId: string) => {
+        let session = activeSessionsByQuizId[quizId];
 
         if (!session) {
+            const roomCode = generateRoomCode();
             session = {
-                roomCode: generateRoomCode(),
+                quizId,
+                roomCode,
                 players: {},
             };
-            activeSessions[quizId] = session;
+            activeSessionsByQuizId[quizId] = session;
+            activeSessionsByRoomCode[roomCode] = session;
         }
 
         if (session.cleanupTimeout) {
@@ -60,26 +60,32 @@ io.on('connection', (socket) => {
             delete session.cleanupTimeout;
         }
 
-        socket.join(session.roomCode);
-        session.players[socket.id] = { ...playerInfo, score: 0 };
+        socket.emit('session_created', { roomCode: session.roomCode });
+    });
 
-        socket.emit('session_ready', {
-            quizId,
-            roomCode: session.roomCode,
+    socket.on('join_game', ({ roomCode, playerInfo }) => {
+        const session = activeSessionsByRoomCode[roomCode];
+        if (!session) {
+            socket.emit('error', { message: 'Room not found' });
+            return;
+        }
+
+        socket.join(roomCode);
+        session.players[socket.id] = playerInfo;
+
+        socket.emit('session_joined', {
             players: session.players,
             ownSocketId: socket.id
         });
 
-        socket.to(session.roomCode).emit('new_player', {
+        socket.to(roomCode).emit('new_player', {
             playerId: socket.id,
             playerInfo: session.players[socket.id]
         });
-        
-        io.to(session.roomCode).emit('leaderboard_update', Object.values(session.players));
     });
 
     socket.on('player_movement', ({ roomCode, x, y }) => {
-        const session = Object.values(activeSessions).find(s => s.roomCode === roomCode);
+        const session = activeSessionsByRoomCode[roomCode];
         if (session?.players[socket.id]) {
             session.players[socket.id].x = x;
             session.players[socket.id].y = y;
@@ -87,39 +93,24 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('update_score', ({ roomCode, score }) => {
-        const session = Object.values(activeSessions).find(s => s.roomCode === roomCode);
-        if (session?.players[socket.id]) {
-            session.players[socket.id].score = score;
-            io.to(roomCode).emit('leaderboard_update', Object.values(session.players));
-        }
-    });
-
     socket.on('disconnect', () => {
-        let quizIdToClean: string | null = null;
-        let roomCodeToNotify: string | null = null;
+        let sessionToUpdate: Session | null = null;
 
-        for (const quizId in activeSessions) {
-            const session = activeSessions[quizId];
+        for (const roomCode in activeSessionsByRoomCode) {
+            const session = activeSessionsByRoomCode[roomCode];
             if (session.players[socket.id]) {
-                roomCodeToNotify = session.roomCode;
+                sessionToUpdate = session;
                 delete session.players[socket.id];
-                io.to(roomCodeToNotify).emit('player_disconnected', socket.id);
-                
+                io.to(roomCode).emit('player_disconnected', socket.id);
+
                 if (Object.keys(session.players).length === 0) {
-                    quizIdToClean = quizId;
-                } else {
-                    io.to(roomCodeToNotify).emit('leaderboard_update', Object.values(session.players));
+                    session.cleanupTimeout = setTimeout(() => {
+                        delete activeSessionsByQuizId[session.quizId];
+                        delete activeSessionsByRoomCode[session.roomCode];
+                    }, 60000);
                 }
                 break;
             }
-        }
-
-        if (quizIdToClean) {
-            const session = activeSessions[quizIdToClean];
-            session.cleanupTimeout = setTimeout(() => {
-                delete activeSessions[quizIdToClean!];
-            }, 60000);
         }
     });
 });
