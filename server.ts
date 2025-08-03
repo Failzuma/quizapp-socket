@@ -1,178 +1,161 @@
-
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
 
 const port = process.env.PORT || 3001;
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://quizapp-socket-production.up.railway.app';
-
 
 interface PlayerData {
     x: number;
     y: number;
     character: string;
     username: string;
-    score: number;
-    user_id: number;
 }
 
 interface Session {
     roomCode: string;
+    players: { [playerId: string]: PlayerData };
     quizId: string;
-    players: {
-        [playerId: string]: PlayerData;
-    };
-    adminToken?: string;
     cleanupTimeout?: NodeJS.Timeout;
 }
 
-const activeSessions: Record<string, Session> = {};
+const activeSessionsByQuizId: { [quizId: string]: Session } = {};
+const activeSessionsByRoomCode: { [roomCode: string]: Session } = {};
 
-const generateRoomCode = (): string => {
-    let code = '';
+// === Rotating log system ===
+function getLogFilePath() {
+    const today = new Date();
+    const dateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD
+    return path.join(__dirname, `logs/server-${dateStr}.log`);
+}
+
+function log(message: string) {
+    const now = new Date();
+    const offsetMs = 7 * 60 * 60 * 1000; // UTC+7
+    const localTime = new Date(now.getTime() + offsetMs);
+    const timestamp = localTime.toISOString().replace('T', ' ').replace('Z', ''); // Format: YYYY-MM-DD HH:mm:ss
+    const logLine = `[${timestamp}] ${message}`;
+    console.log(logLine);
+
+    const logPath = getLogFilePath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, logLine + '\n');
+}
+
+
+// === Room code generator ===
+function generateRoomCode(): string {
     const chars = 'ABCDEFGHIJKLMNPQRSTUVWXYZ123456789';
+    let code = '';
     for (let i = 0; i < 6; i++) {
         code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    const isCodeInUse = Object.values(activeSessions).some(session => session.roomCode === code);
-    if (isCodeInUse) {
-        return generateRoomCode();
-    }
-    return code;
-};
+    return activeSessionsByRoomCode[code] ? generateRoomCode() : code;
+}
 
 const httpServer = createServer();
 
 const io = new Server(httpServer, {
     cors: {
-        origin: "*", 
-        methods: ["GET", "POST"]
+        origin: '*',
+        methods: ['GET', 'POST']
     }
 });
 
 io.on('connection', (socket) => {
-    socket.on('request_session', ({ quizId, playerInfo, token }) => {
-        let session = activeSessions[quizId];
+    const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+    log(`[+] New connection: ${socket.id} from ${ip}`);
+
+    socket.on('request_session', (quizId: string) => {
+        let session = activeSessionsByQuizId[quizId];
 
         if (!session) {
+            const roomCode = generateRoomCode();
             session = {
-                roomCode: generateRoomCode(),
-                quizId: quizId,
+                quizId,
+                roomCode,
                 players: {},
-                adminToken: playerInfo.role === 'admin' ? token : undefined,
             };
-            activeSessions[quizId] = session;
+            activeSessionsByQuizId[quizId] = session;
+            activeSessionsByRoomCode[roomCode] = session;
+            log(`[+] Created new session: quiz=${quizId}, room=${roomCode}`);
+        } else {
+            log(`[=] Reusing existing session: quiz=${quizId}, room=${session.roomCode}`);
         }
 
         if (session.cleanupTimeout) {
             clearTimeout(session.cleanupTimeout);
             delete session.cleanupTimeout;
+            log(`[~] Cancelled cleanup timeout for room ${session.roomCode}`);
         }
 
-        socket.join(session.roomCode);
-        session.players[socket.id] = { ...playerInfo, score: 0 };
+        socket.emit('session_created', { roomCode: session.roomCode });
+    });
 
-        socket.emit('session_ready', {
-            quizId,
-            roomCode: session.roomCode,
+    socket.on('join_game', ({ roomCode, playerInfo }) => {
+        const session = activeSessionsByRoomCode[roomCode];
+        if (!session) {
+            log(`[!] Failed join: Room ${roomCode} not found`);
+            socket.emit('error', { message: 'Room not found' });
+            return;
+        }
+
+        socket.join(roomCode);
+        session.players[socket.id] = playerInfo;
+
+        log(`[+] ${playerInfo.username} (${socket.id}) joined room ${roomCode}`);
+
+        socket.emit('session_joined', {
             players: session.players,
             ownSocketId: socket.id
         });
 
-        socket.to(session.roomCode).emit('new_player', {
+        socket.to(roomCode).emit('new_player', {
             playerId: socket.id,
-            playerInfo: session.players[socket.id]
+            playerInfo: playerInfo
         });
-        
-        io.to(session.roomCode).emit('leaderboard_update', Object.values(session.players));
     });
 
     socket.on('player_movement', ({ roomCode, x, y }) => {
-        const session = Object.values(activeSessions).find(s => s.roomCode === roomCode);
+        const session = activeSessionsByRoomCode[roomCode];
         if (session?.players[socket.id]) {
             session.players[socket.id].x = x;
             session.players[socket.id].y = y;
-            socket.to(roomCode).emit('player_moved', { playerId: socket.id, x, y });
-        }
-    });
 
-    socket.on('update_score', ({ roomCode, score }) => {
-        const session = Object.values(activeSessions).find(s => s.roomCode === roomCode);
-        if (session?.players[socket.id]) {
-            session.players[socket.id].score = score;
-            io.to(roomCode).emit('leaderboard_update', Object.values(session.players));
-        }
-    });
+            log(`[~] Move: ${socket.id} (${session.players[socket.id].username}) @ ${roomCode} => (${x}, ${y})`);
 
-    socket.on('admin_end_quiz', async ({ roomCode, token }) => {
-        const session = Object.values(activeSessions).find(s => s.roomCode === roomCode);
-
-        if (session && session.adminToken === token) {
-            const leaderboard = Object.values(session.players);
-
-            try {
-                const response = await fetch(`${API_BASE_URL}/quizzes/results`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${token}`
-                    },
-                    body: JSON.stringify({
-                        quizId: session.quizId,
-                        leaderboard: leaderboard
-                    })
-                });
-
-                if (response.ok) {
-                    io.to(roomCode).emit('quiz_ended', { message: 'Quiz has been ended by the admin.' });
-                    delete activeSessions[session.quizId];
-                } else {
-                    const errorData = await response.json();
-                    socket.emit('error_ending_quiz', { message: 'Failed to save results.', details: errorData });
-                }
-            } catch (error) {
-                console.error('Error saving quiz results:', error);
-                socket.emit('error_ending_quiz', { message: 'Server error while trying to end quiz.' });
-            }
-        } else {
-            socket.emit('error_ending_quiz', { message: 'Unauthorized or invalid session.' });
+            socket.to(roomCode).emit('player_moved', {
+                playerId: socket.id,
+                x,
+                y
+            });
         }
     });
 
     socket.on('disconnect', () => {
-        let quizIdToClean: string | null = null;
-        let roomCodeToNotify: string | null = null;
-
-        for (const quizId in activeSessions) {
-            const session = activeSessions[quizId];
+        for (const roomCode in activeSessionsByRoomCode) {
+            const session = activeSessionsByRoomCode[roomCode];
             if (session.players[socket.id]) {
-                roomCodeToNotify = session.roomCode;
-                // If the disconnecting player was the admin, nullify the admin token
-                if (session.adminToken && session.players[socket.id].role === 'admin') {
-                    session.adminToken = undefined; 
-                }
-
+                const username = session.players[socket.id].username;
                 delete session.players[socket.id];
-                io.to(roomCodeToNotify).emit('player_disconnected', socket.id);
-                
+
+                log(`[-] Disconnected: ${socket.id} (${username}) from room ${roomCode}`);
+                io.to(roomCode).emit('player_disconnected', socket.id);
+
                 if (Object.keys(session.players).length === 0) {
-                    quizIdToClean = quizId;
-                } else {
-                    io.to(roomCodeToNotify).emit('leaderboard_update', Object.values(session.players));
+                    session.cleanupTimeout = setTimeout(() => {
+                        delete activeSessionsByQuizId[session.quizId];
+                        delete activeSessionsByRoomCode[session.roomCode];
+                        log(`[x] Session cleaned up: room ${roomCode}, quiz ${session.quizId}`);
+                    }, 60000);
+                    log(`[~] Room ${roomCode} empty. Cleanup in 60s.`);
                 }
                 break;
             }
-        }
-
-        if (quizIdToClean) {
-            const session = activeSessions[quizIdToClean];
-            session.cleanupTimeout = setTimeout(() => {
-                delete activeSessions[quizIdToClean!];
-            }, 60000); // 1 minute cleanup delay
         }
     });
 });
 
 httpServer.listen(port, () => {
-    console.log(`> Server WebSocket berjalan di port ${port}`);
+    log(`🚀 Server WebSocket running on port ${port}`);
 });
