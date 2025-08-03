@@ -30,7 +30,10 @@ function getLogFilePath() {
 }
 
 function log(message: string) {
-    const timestamp = new Date().toISOString();
+    const now = new Date();
+    const offsetMs = 7 * 60 * 60 * 1000; // UTC+7
+    const localTime = new Date(now.getTime() + offsetMs);
+    const timestamp = localTime.toISOString().replace('T', ' ').replace('Z', ''); // Format: YYYY-MM-DD HH:mm:ss
     const logLine = `[${timestamp}] ${message}`;
     console.log(logLine);
 
@@ -38,6 +41,7 @@ function log(message: string) {
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
     fs.appendFileSync(logPath, logLine + '\n');
 }
+
 
 // === Room code generator ===
 function generateRoomCode(): string {
